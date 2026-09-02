@@ -1,13 +1,19 @@
 """Tests for MedlinePlus scraping helpers."""
 
+import logging
+
 import httpx
 import pytest
+from typer.testing import CliRunner
 
+from amfv_datasets.scraping.base import ScrapedDocument, ScrapeRun
+from amfv_datasets.scraping.cli import SCRAPERS, app
 from amfv_datasets.scraping.html import LinkMode
 from amfv_datasets.scraping.medlineplus import (
     BASE_URL,
     MedlineplusFetchError,
     list_topic_urls,
+    scrape_medlineplus,
     scrape_topic,
     topic_slug_from_url,
 )
@@ -29,6 +35,18 @@ _TOPIC_HTML = """
       <div id="topic-summary" class="syndicate">
         <p>A1C tests for <a href="/diabetestype2.html">type 2 diabetes</a>.</p>
       </div>
+    </div>
+  </body>
+</html>
+"""
+
+_TOPIC_HTML_ASTHMA = """
+<html>
+  <head><meta name="DC.Title" content="Asthma" /></head>
+  <body>
+    <div id="topic">
+      <h1>Asthma</h1>
+      <div id="topic-summary" class="syndicate"><p>Asthma affects the airways.</p></div>
     </div>
   </body>
 </html>
@@ -122,6 +140,25 @@ def test_scrape_topic_skips_pages_without_a_summary() -> None:
     assert scrape_topic(client, "https://medlineplus.gov/healthchecktools.html") is None
 
 
+def test_scrape_topic_skips_and_logs_a_page_that_fails_to_fetch(caplog: pytest.LogCaptureFixture) -> None:
+    """One unreachable page is skipped rather than aborting the whole crawl."""
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
+
+    with caplog.at_level(logging.WARNING):
+        document = scrape_topic(client, "https://medlineplus.gov/a1c.html")
+
+    assert document is None
+    assert "a1c.html" in caplog.text
+
+
+def test_list_topic_urls_raises_medlineplus_fetch_error_when_the_sitemap_fails() -> None:
+    """A sitemap fetch failure raises this module's error type, not a raw httpx error."""
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
+
+    with pytest.raises(MedlineplusFetchError, match="Could not fetch"):
+        list_topic_urls(client)
+
+
 @pytest.mark.parametrize(
     ("url", "expected_message"),
     [
@@ -165,3 +202,89 @@ def test_third_party_licensed_corpora_are_never_scraped(url: str) -> None:
         list_topic_urls(client)
     with pytest.raises(MedlineplusFetchError, match="English topic URL"):
         topic_slug_from_url(url)
+
+
+def test_scrape_medlineplus_scrapes_every_topic_and_fetches_the_sitemap_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SCRAPERS entry point discovers topics from the sitemap and scrapes each one."""
+    sitemap = (
+        '<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        "<url><loc>https://medlineplus.gov/a1c.html</loc></url>"
+        "<url><loc>https://medlineplus.gov/asthma.html</loc></url>"
+        "</urlset>"
+    )
+    request_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_paths.append(request.url.path)
+        if request.url.path == "/sitemap.xml":
+            return httpx.Response(200, content=sitemap.encode("utf-8"))
+        if request.url.path == "/a1c.html":
+            return httpx.Response(200, text=_TOPIC_HTML)
+        if request.url.path == "/asthma.html":
+            return httpx.Response(200, text=_TOPIC_HTML_ASTHMA)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    # scrape_medlineplus opens a fresh client per default_client() call (one for
+    # discovery, one inside scrape_listing_documents), so this must be a factory
+    # rather than a single shared client, which scrape_listing_documents closes
+    # after its own use.
+    monkeypatch.setattr(
+        "amfv_datasets.scraping.medlineplus.default_client",
+        lambda: httpx.Client(transport=httpx.MockTransport(handler), base_url=BASE_URL),
+    )
+    monkeypatch.setattr("amfv_datasets.scraping.base.time.sleep", lambda seconds: None)
+
+    scrape_run = scrape_medlineplus(documents=None, link_mode=LinkMode.KEEP)
+    documents = list(scrape_run.documents)
+
+    assert scrape_run.total == 2
+    assert {document.title for document in documents} == {"A1C", "Asthma"}
+    assert request_paths.count("/sitemap.xml") == 1
+
+
+def test_scrape_medlineplus_url_mode_normalizes_a_www_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A www.-prefixed --url still resolves to the canonical medlineplus.gov page."""
+    request_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_paths.append(request.url.path)
+        assert request.url.host == "medlineplus.gov"
+        return httpx.Response(200, text=_TOPIC_HTML)
+
+    monkeypatch.setattr(
+        "amfv_datasets.scraping.medlineplus.default_client",
+        lambda: httpx.Client(transport=httpx.MockTransport(handler), base_url=BASE_URL),
+    )
+
+    scrape_run = scrape_medlineplus(documents=None, url="https://www.medlineplus.gov/a1c.html")
+    documents = list(scrape_run.documents)
+
+    assert scrape_run.total == 1
+    assert len(documents) == 1
+    assert documents[0].url == "https://medlineplus.gov/a1c.html"
+    assert request_paths == ["/a1c.html"]
+
+
+def test_cli_dispatches_the_medlineplus_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--source medlineplus resolves through the CLI's SCRAPERS registry to this module."""
+
+    def fake_scrape_medlineplus(*, documents: int | None, link_mode: LinkMode, url: str | None = None) -> ScrapeRun:
+        assert documents == 2
+        assert url is None
+        document = ScrapedDocument(
+            source="medlineplus",
+            external_id="medlineplus-a1c",
+            title="A1C",
+            url="https://medlineplus.gov/a1c.html",
+            content="content",
+        )
+        return ScrapeRun([document], total=1)
+
+    monkeypatch.setitem(SCRAPERS, "medlineplus", fake_scrape_medlineplus)
+
+    result = CliRunner().invoke(app, ["--source", "medlineplus", "--documents", "2", "--no-progress"])
+
+    assert result.exit_code == 0
+    assert '"external_id": "medlineplus-a1c"' in result.stdout

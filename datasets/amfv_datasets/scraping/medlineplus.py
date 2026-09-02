@@ -22,10 +22,15 @@ scope: A.D.A.M. encyclopedia articles (`/ency/`) and ASHP drug monographs
 (`/druginfo/`) cannot be redistributed without licensing from those vendors,
 and neither matches the flat topic path this scraper accepts. See
 https://medlineplus.gov/about/using/usingcontent/.
+
+Documents are short: live samples run 500-6,500 characters, median ~1,600,
+since these are patient-facing summaries rather than clinical guidelines. For
+comparison, the NICE scraper's guidelines run a median of 23,817 characters.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable
 from urllib.parse import urlparse
@@ -52,6 +57,8 @@ ATTRIBUTION = "Courtesy of MedlinePlus from the National Library of Medicine"
 DOCUMENT_DELAY_SECONDS = 1.0
 """Delay between topic pages. MedlinePlus robots.txt sets no Crawl-delay, so
 this is a politeness floor rather than a required interval."""
+
+logger = logging.getLogger(__name__)
 
 _SITEMAP_NS = {"sitemap": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 # English topic pages are a single flat slug, e.g. /a1c.html. Anything nested
@@ -91,8 +98,11 @@ def list_topic_urls(client: httpx.Client) -> list[str]:
     Args:
         client: HTTP client used to fetch the sitemap.
     """
-    response = client.get(SITEMAP_URL)
-    response.raise_for_status()
+    try:
+        response = client.get(SITEMAP_URL)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise MedlineplusFetchError(f"Could not fetch the MedlinePlus sitemap at {SITEMAP_URL}") from exc
     try:
         root = etree.fromstring(response.content)
     except etree.XMLSyntaxError as exc:
@@ -118,7 +128,9 @@ def scrape_topic(client: httpx.Client, url: str, *, link_mode: LinkMode = LinkMo
     """Scrape one MedlinePlus topic page into a normalized document.
 
     Returns None when the page carries no summary container, which is how
-    non-topic pages in the sitemap are skipped.
+    non-topic pages in the sitemap are skipped, or when the page could not be
+    fetched, which is logged rather than raised so one unreachable page in a
+    large crawl costs a document instead of the whole run.
 
     Args:
         client: HTTP client used to fetch the topic page.
@@ -126,8 +138,12 @@ def scrape_topic(client: httpx.Client, url: str, *, link_mode: LinkMode = LinkMo
         link_mode: Whether links are kept as markdown links or stripped to
             their visible text (default: LinkMode.KEEP).
     """
-    response = client.get(url)
-    response.raise_for_status()
+    try:
+        response = client.get(url)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.warning("Skipping MedlinePlus topic %s: %s", url, exc)
+        return None
     doc = lxml_html.fromstring(response.text)
 
     summaries = doc.xpath('//div[@id="topic-summary"]')
@@ -190,7 +206,7 @@ def scrape_medlineplus(
         topic_urls = list_topic_urls(client)
 
     return ScrapeRun(
-        total=documents,
+        total=documents if documents is not None else len(topic_urls),
         documents=scrape_listing_documents(
             documents=documents,
             client_factory=default_client,
