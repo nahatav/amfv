@@ -17,10 +17,25 @@ parameter, which we send as `EUTILS_TOOL`; discovery issues two sequential
 requests per listing page, well inside that limit. Anyone running a full-corpus
 scrape should additionally register a `tool`/`email` pair with NCBI and run it
 outside US peak hours, as that policy requests for large jobs.
+
+Licensing: unlike MedlinePlus, StatPearls chapters are not public domain.
+NCBI's own copyright dialog on the book page states "Copyright (c) 2026,
+StatPearls Publishing LLC," distributed under CC BY-NC-ND 4.0
+(https://creativecommons.org/licenses/by-nc-nd/4.0/): NonCommercial, and
+NoDerivatives. Every document carries `LICENSE` and `LICENSE_URL` in its
+metadata so this travels downstream. The ND term is worth reading carefully
+before this corpus feeds claim decomposition or training data, both of which
+are derivative uses of the source text; that call belongs to whoever is
+building those pipelines, not to this scraper.
+
+Typical chapter is substantially larger than a MedlinePlus topic: live
+samples run 27,500-65,400 characters across 16-20 top-level sections, versus
+a MedlinePlus topic's ~1,600-character median.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -48,6 +63,10 @@ EUTILS_TOOL = "amfv-datasets"
 """Identifies this client to NCBI, as E-utilities usage policy asks callers to do."""
 STATPEARLS_DATASET_NAME = "statpearls-webscrape"
 STATPEARLS_DATASET_DISPLAY_NAME = "StatPearls Webscrape"
+LICENSE = "CC BY-NC-ND 4.0"
+LICENSE_URL = "https://creativecommons.org/licenses/by-nc-nd/4.0/"
+
+logger = logging.getLogger(__name__)
 
 _ACCESSION_URL_RE = re.compile(r"/books/(NBK\d+)")
 # NCBI Bookshelf pages are served as XHTML with a leading <?xml ...?> declaration,
@@ -88,18 +107,21 @@ def search_section_uids(client: httpx.Client, *, retstart: int, retmax: int = SE
         retstart: Offset into the search result set.
         retmax: Maximum number of section UIDs to return (default: SECTION_BATCH_SIZE).
     """
-    response = client.get(
-        f"{EUTILS_BASE_URL}/esearch.fcgi",
-        params={
-            "db": "books",
-            "term": STATPEARLS_QUERY,
-            "retstart": retstart,
-            "retmax": retmax,
-            "retmode": "json",
-            "tool": EUTILS_TOOL,
-        },
-    )
-    response.raise_for_status()
+    try:
+        response = client.get(
+            f"{EUTILS_BASE_URL}/esearch.fcgi",
+            params={
+                "db": "books",
+                "term": STATPEARLS_QUERY,
+                "retstart": retstart,
+                "retmax": retmax,
+                "retmode": "json",
+                "tool": EUTILS_TOOL,
+            },
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise StatpearlsFetchError(f"Could not search StatPearls sections at retstart {retstart}") from exc
     return response.json()["esearchresult"]["idlist"]
 
 
@@ -112,11 +134,14 @@ def summarize_chapters(client: httpx.Client, section_uids: list[str]) -> list[Ch
     """
     if not section_uids:
         return []
-    response = client.get(
-        f"{EUTILS_BASE_URL}/esummary.fcgi",
-        params={"db": "books", "id": ",".join(section_uids), "retmode": "json", "tool": EUTILS_TOOL},
-    )
-    response.raise_for_status()
+    try:
+        response = client.get(
+            f"{EUTILS_BASE_URL}/esummary.fcgi",
+            params={"db": "books", "id": ",".join(section_uids), "retmode": "json", "tool": EUTILS_TOOL},
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise StatpearlsFetchError(f"Could not summarize {len(section_uids)} StatPearls sections") from exc
     result = response.json()["result"]
     refs: list[ChapterRef] = []
     for uid in result.get("uids", []):
@@ -150,8 +175,14 @@ def list_chapters(client: httpx.Client, page: int, *, seen: set[str]) -> list[Ch
     return new_refs
 
 
-def scrape_chapter(client: httpx.Client, ref: ChapterRef, *, link_mode: LinkMode = LinkMode.KEEP) -> ScrapedDocument:
+def scrape_chapter(
+    client: httpx.Client, ref: ChapterRef, *, link_mode: LinkMode = LinkMode.KEEP
+) -> ScrapedDocument | None:
     """Scrape one StatPearls chapter into a normalized document.
+
+    Returns None when the chapter cannot be fetched or has no readable
+    content, which is logged rather than raised so one bad chapter in a
+    multi-hour crawl costs a document instead of the whole run.
 
     Args:
         client: HTTP client used to fetch the chapter page.
@@ -159,11 +190,16 @@ def scrape_chapter(client: httpx.Client, ref: ChapterRef, *, link_mode: LinkMode
         link_mode: Whether links are kept as markdown links or stripped to
             their visible text (default: LinkMode.KEEP).
     """
-    response = client.get(chapter_url(ref.accession))
-    response.raise_for_status()
+    try:
+        response = client.get(chapter_url(ref.accession))
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.warning("Skipping StatPearls chapter %s: %s", ref.accession, exc)
+        return None
     content, section_count = _chapter_content(response.text, link_mode=link_mode)
     if not content:
-        raise StatpearlsFetchError(f"No readable content for StatPearls chapter '{ref.accession}'")
+        logger.warning("Skipping StatPearls chapter %s: no readable content", ref.accession)
+        return None
     return ScrapedDocument(
         source="statpearls",
         external_id=f"statpearls-{ref.accession}",
@@ -171,12 +207,15 @@ def scrape_chapter(client: httpx.Client, ref: ChapterRef, *, link_mode: LinkMode
         url=chapter_url(ref.accession),
         content=content,
         section_count=section_count,
-        metadata={"accession": ref.accession},
+        metadata={"accession": ref.accession, "license": LICENSE, "license_url": LICENSE_URL},
     )
 
 
 def scrape_chapter_by_url(client: httpx.Client, url: str, *, link_mode: LinkMode = LinkMode.KEEP) -> ScrapedDocument:
     """Scrape a StatPearls chapter from its NCBI Bookshelf URL.
+
+    Unlike `scrape_chapter`, this raises on failure rather than returning
+    None: a single `--url` request has no other document to fall back on.
 
     Args:
         client: HTTP client used to fetch the chapter page.
@@ -189,8 +228,11 @@ def scrape_chapter_by_url(client: httpx.Client, url: str, *, link_mode: LinkMode
         raise StatpearlsFetchError(f"Enter a StatPearls chapter URL like {BOOKS_BASE_URL}/NBK430685/; got {url!r}")
     accession = match.group(1)
 
-    response = client.get(chapter_url(accession))
-    response.raise_for_status()
+    try:
+        response = client.get(chapter_url(accession))
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise StatpearlsFetchError(f"Could not fetch StatPearls chapter '{accession}'") from exc
     content, section_count = _chapter_content(response.text, link_mode=link_mode)
     if not content:
         raise StatpearlsFetchError(f"No readable content for StatPearls chapter '{accession}'")
@@ -206,7 +248,7 @@ def scrape_chapter_by_url(client: httpx.Client, url: str, *, link_mode: LinkMode
         url=chapter_url(accession),
         content=content,
         section_count=section_count,
-        metadata={"accession": accession},
+        metadata={"accession": accession, "license": LICENSE, "license_url": LICENSE_URL},
     )
 
 
@@ -237,6 +279,9 @@ def scrape_statpearls(
 
     seen: set[str] = set()
     return ScrapeRun(
+        # Unlike MedlinePlus's sitemap, chapter discovery here is itself
+        # incremental (one search page at a time), so there is no cheap
+        # upper bound to report before a full run other than `documents`.
         total=documents,
         documents=scrape_listing_documents(
             documents=documents,
@@ -278,6 +323,8 @@ __all__ = [
     "DOCUMENT_DELAY_SECONDS",
     "EUTILS_BASE_URL",
     "EUTILS_TOOL",
+    "LICENSE",
+    "LICENSE_URL",
     "SECTION_BATCH_SIZE",
     "STATPEARLS_DATASET_DISPLAY_NAME",
     "STATPEARLS_DATASET_NAME",
