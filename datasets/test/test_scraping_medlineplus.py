@@ -115,6 +115,8 @@ def test_scrape_topic_converts_summary_and_collects_metadata() -> None:
     assert document.content == "A1C tests for [type 2 diabetes](https://medlineplus.gov/diabetestype2.html)."
     assert document.metadata == {
         "attribution": "Courtesy of MedlinePlus from the National Library of Medicine",
+        "license": "Public Domain (U.S. Government work)",
+        "license_url": "https://medlineplus.gov/about/using/usingcontent/",
         "also_called": ["Hemoglobin A1c", "HbA1c"],
         "date_created": "2015-12-22",
         "date_modified": "2026-08-01",

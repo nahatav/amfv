@@ -17,8 +17,10 @@ container (indexes, tools, directories) are not health topics and are skipped.
 
 Licensing: NLM places health topic summaries in the public domain and allows
 redistribution with the acknowledgement carried on every scraped document as
-`ATTRIBUTION`. Content NLM licenses from third parties is deliberately out of
-scope: A.D.A.M. encyclopedia articles (`/ency/`) and ASHP drug monographs
+`ATTRIBUTION`, alongside `LICENSE`/`LICENSE_URL` so a corpus can be filtered
+by source rights without parsing prose. Content NLM licenses from third
+parties is deliberately out of scope:
+A.D.A.M. encyclopedia articles (`/ency/`) and ASHP drug monographs
 (`/druginfo/`) cannot be redistributed without licensing from those vendors,
 and neither matches the flat topic path this scraper accepts. See
 https://medlineplus.gov/about/using/usingcontent/.
@@ -54,6 +56,8 @@ MEDLINEPLUS_DATASET_NAME = "medlineplus-webscrape"
 MEDLINEPLUS_DATASET_DISPLAY_NAME = "MedlinePlus Webscrape"
 ATTRIBUTION = "Courtesy of MedlinePlus from the National Library of Medicine"
 """Acknowledgement NLM asks redistributors of public domain content to carry."""
+LICENSE = "Public Domain (U.S. Government work)"
+LICENSE_URL = "https://medlineplus.gov/about/using/usingcontent/"
 DOCUMENT_DELAY_SECONDS = 1.0
 """Delay between topic pages. MedlinePlus robots.txt sets no Crawl-delay, so
 this is a politeness floor rather than a required interval."""
@@ -165,6 +169,8 @@ def scrape_topic(client: httpx.Client, url: str, *, link_mode: LinkMode = LinkMo
         content=content,
         metadata={
             "attribution": ATTRIBUTION,
+            "license": LICENSE,
+            "license_url": LICENSE_URL,
             "also_called": _meta_values(doc, "DC.Title.Alternate"),
             "date_created": _meta_value(doc, "DC.Date.Created"),
             "date_modified": _meta_value(doc, "DC.Date.Modified"),
@@ -237,6 +243,8 @@ __all__ = [
     "ATTRIBUTION",
     "BASE_URL",
     "DOCUMENT_DELAY_SECONDS",
+    "LICENSE",
+    "LICENSE_URL",
     "MEDLINEPLUS_DATASET_DISPLAY_NAME",
     "MEDLINEPLUS_DATASET_NAME",
     "SITEMAP_URL",
