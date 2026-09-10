@@ -14,9 +14,10 @@ apply between chapter fetches. E-utilities usage policy (see
 https://www.ncbi.nlm.nih.gov/books/NBK25497/) asks for at most 3 requests per
 second without an API key and for callers to identify themselves via the `tool`
 parameter, which we send as `EUTILS_TOOL`; discovery issues two sequential
-requests per listing page, well inside that limit. Anyone running a full-corpus
-scrape should additionally register a `tool`/`email` pair with NCBI and run it
-outside US peak hours, as that policy requests for large jobs.
+requests per section batch, and batches taken back to back are spaced by
+`SEARCH_DELAY_SECONDS`, which keeps it inside that limit. Anyone running a
+full-corpus scrape should additionally register a `tool`/`email` pair with NCBI
+and run it outside US peak hours, as that policy requests for large jobs.
 
 Licensing: unlike MedlinePlus, StatPearls chapters are not public domain.
 NCBI's own copyright dialog on the book page states "Copyright (c) 2026,
@@ -37,8 +38,9 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -59,6 +61,11 @@ EUTILS_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 STATPEARLS_QUERY = "statpearls[book]"
 SECTION_BATCH_SIZE = 200
 DOCUMENT_DELAY_SECONDS = 5.0
+SEARCH_DELAY_SECONDS = 1.0
+"""Spacing between back-to-back section-search batches, which `list_chapters` can
+need when a batch holds no chapter it has not already yielded. Batches consumed
+inside one call are not separated by a document fetch the way listing pages are,
+so they are paced here to stay inside NCBI's 3-requests-per-second guidance."""
 EUTILS_TOOL = "amfv-datasets"
 """Identifies this client to NCBI, as E-utilities usage policy asks callers to do."""
 STATPEARLS_DATASET_NAME = "statpearls-webscrape"
@@ -153,26 +160,55 @@ def summarize_chapters(client: httpx.Client, section_uids: list[str]) -> list[Ch
     return refs
 
 
-def list_chapters(client: httpx.Client, page: int, *, seen: set[str]) -> list[ChapterRef]:
-    """Return chapters newly discovered on one page of the section search index.
+@dataclass
+class ChapterSearch:
+    """Cursor into the section search index, and the chapters it has yielded.
 
-    Chapters already present in `seen` are skipped. Sections for a chapter are
-    returned by NCBI clustered together, so a search page is only empty of new
-    chapters when the underlying section search itself is exhausted.
+    Attributes:
+        retstart: Offset of the next section batch to request.
+        exhausted: Whether the section search has run out of results.
+        seen: Chapter accessions already yielded.
+    """
+
+    retstart: int = 0
+    exhausted: bool = False
+    seen: set[str] = field(default_factory=set)
+
+
+def list_chapters(client: httpx.Client, *, search: ChapterSearch) -> list[ChapterRef]:
+    """Return the next chapters discovered from the section search index.
+
+    The search returns one hit per chapter *section*, so a chapter occupies as
+    many hits as it has sections and a whole batch can consist of sections whose
+    chapters were already yielded. That is not the end of the source, but
+    `scrape_listing_documents` stops at the first page that comes back empty, so
+    returning the empty remainder would end the crawl with chapters unscraped.
+    Batches are therefore consumed until one contributes a chapter or the search
+    itself runs out, which is the only condition that returns empty here.
 
     Args:
         client: HTTP client used to query E-utilities.
-        page: 1-indexed search page; each page covers `SECTION_BATCH_SIZE` sections.
-        seen: Chapter accessions already yielded on earlier pages; updated in place.
+        search: Cursor into the section search, updated in place.
     """
-    section_uids = search_section_uids(client, retstart=(page - 1) * SECTION_BATCH_SIZE)
-    new_refs = []
-    for ref in summarize_chapters(client, section_uids):
-        if ref.accession in seen:
-            continue
-        seen.add(ref.accession)
-        new_refs.append(ref)
-    return new_refs
+    continued = False
+    while not search.exhausted:
+        if continued:
+            time.sleep(SEARCH_DELAY_SECONDS)
+        continued = True
+        section_uids = search_section_uids(client, retstart=search.retstart)
+        search.retstart += SECTION_BATCH_SIZE
+        if not section_uids:
+            search.exhausted = True
+            break
+        new_refs = []
+        for ref in summarize_chapters(client, section_uids):
+            if ref.accession in search.seen:
+                continue
+            search.seen.add(ref.accession)
+            new_refs.append(ref)
+        if new_refs:
+            return new_refs
+    return []
 
 
 def scrape_chapter(
@@ -196,7 +232,7 @@ def scrape_chapter(
     except httpx.HTTPError as exc:
         logger.warning("Skipping StatPearls chapter %s: %s", ref.accession, exc)
         return None
-    content, section_count = _chapter_content(response.text, link_mode=link_mode)
+    content, section_count = _chapter_content(response.text, base_url=chapter_url(ref.accession), link_mode=link_mode)
     if not content:
         logger.warning("Skipping StatPearls chapter %s: no readable content", ref.accession)
         return None
@@ -233,7 +269,7 @@ def scrape_chapter_by_url(client: httpx.Client, url: str, *, link_mode: LinkMode
         response.raise_for_status()
     except httpx.HTTPError as exc:
         raise StatpearlsFetchError(f"Could not fetch StatPearls chapter '{accession}'") from exc
-    content, section_count = _chapter_content(response.text, link_mode=link_mode)
+    content, section_count = _chapter_content(response.text, base_url=chapter_url(accession), link_mode=link_mode)
     if not content:
         raise StatpearlsFetchError(f"No readable content for StatPearls chapter '{accession}'")
     title = document_title(
@@ -277,7 +313,7 @@ def scrape_statpearls(
 
         return ScrapeRun(documents=scrape_url(), total=1)
 
-    seen: set[str] = set()
+    search = ChapterSearch()
     return ScrapeRun(
         # Unlike MedlinePlus's sitemap, chapter discovery here is itself
         # incremental (one search page at a time), so there is no cheap
@@ -285,8 +321,10 @@ def scrape_statpearls(
         total=documents,
         documents=scrape_listing_documents(
             documents=documents,
+            # The page index is unused: `search` carries its own cursor, because
+            # one call can consume several batches before it finds a chapter.
+            list_page=lambda client, _page: list_chapters(client, search=search),
             client_factory=default_client,
-            list_page=lambda client, page: list_chapters(client, page, seen=seen),
             scrape_item=lambda client, ref: scrape_chapter(client, ref, link_mode=link_mode),
             document_delay_seconds=DOCUMENT_DELAY_SECONDS,
         ),
@@ -305,8 +343,19 @@ def _chapter_title(record: dict[str, Any]) -> str:
     return titles[0].strip() if titles else ""
 
 
-def _chapter_content(html_text: str, *, link_mode: LinkMode) -> tuple[str, int]:
-    """Return a chapter body as markdown and its top-level section count."""
+def _chapter_content(html_text: str, *, base_url: str, link_mode: LinkMode) -> tuple[str, int]:
+    """Return a chapter body as markdown and its top-level section count.
+
+    Args:
+        html_text: Chapter page HTML.
+        base_url: URL of the page `html_text` came from, used to resolve the
+            relative links it contains. A relative link means something only
+            against the page that carries it, so passing the Bookshelf root
+            here would resolve `related/` to `/related/` instead of
+            `/books/NBK430685/related/`.
+        link_mode: Whether links are kept as markdown links or stripped to
+            their visible text.
+    """
     doc = lxml_html.fromstring(_XML_DECLARATION_RE.sub("", html_text))
     bodies = doc.xpath('//div[@itemprop="text"]')
     if not bodies:
@@ -314,7 +363,7 @@ def _chapter_content(html_text: str, *, link_mode: LinkMode) -> tuple[str, int]:
     body = bodies[0]
     sections = [child for child in body.xpath("./div[@id]") if _TOP_LEVEL_SECTION_RE.fullmatch(child.get("id") or "")]
     body_html = lxml_html.tostring(body, encoding="unicode")
-    markdown = html_to_markdown(body_html, link_mode=link_mode, base_url=BOOKS_BASE_URL)
+    markdown = html_to_markdown(body_html, link_mode=link_mode, base_url=base_url)
     return markdown, max(len(sections), 1)
 
 
@@ -325,11 +374,13 @@ __all__ = [
     "EUTILS_TOOL",
     "LICENSE",
     "LICENSE_URL",
+    "SEARCH_DELAY_SECONDS",
     "SECTION_BATCH_SIZE",
     "STATPEARLS_DATASET_DISPLAY_NAME",
     "STATPEARLS_DATASET_NAME",
     "STATPEARLS_QUERY",
     "ChapterRef",
+    "ChapterSearch",
     "StatpearlsFetchError",
     "chapter_url",
     "list_chapters",

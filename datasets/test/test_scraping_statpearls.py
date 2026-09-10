@@ -14,6 +14,7 @@ from amfv_datasets.scraping.statpearls import (
     LICENSE,
     LICENSE_URL,
     ChapterRef,
+    ChapterSearch,
     StatpearlsFetchError,
     list_chapters,
     scrape_chapter,
@@ -137,15 +138,72 @@ def test_list_chapters_deduplicates_chapters_seen_on_earlier_pages() -> None:
         return httpx.Response(200, text=json.dumps(payload))
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    seen: set[str] = set()
+    search = ChapterSearch()
 
-    first_page = list_chapters(client, 1, seen=seen)
+    first_page = list_chapters(client, search=search)
 
     assert first_page == [
         ChapterRef(accession="NBK111", title="Chapter One"),
         ChapterRef(accession="NBK222", title="Chapter Two"),
     ]
-    assert seen == {"NBK111", "NBK222"}
+    assert search.seen == {"NBK111", "NBK222"}
+
+
+def test_list_chapters_continues_past_a_batch_holding_only_seen_chapters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch that adds no chapter must not be reported as the end of the source.
+
+    Sections of one chapter can fill a whole batch, and `scrape_listing_documents`
+    stops at the first page that comes back empty, so returning the empty
+    remainder would leave every later chapter unscraped.
+    """
+    monkeypatch.setattr("amfv_datasets.scraping.statpearls.time.sleep", lambda _seconds: None)
+    batches = {"0": ["111"], "200": ["112"], "400": ["113"]}
+    summaries = {
+        "111": {"chapteraccessionid": "NBK111", "bookinfo": _bookinfo("Chapter One")},
+        # A second section of the chapter the first batch already yielded.
+        "112": {"chapteraccessionid": "NBK111", "bookinfo": _bookinfo("Chapter One")},
+        "113": {"chapteraccessionid": "NBK222", "bookinfo": _bookinfo("Chapter Two")},
+    }
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/entrez/eutils/esearch.fcgi":
+            retstart = request.url.params["retstart"]
+            requested.append(retstart)
+            return httpx.Response(200, text=json.dumps({"esearchresult": {"idlist": batches.get(retstart, [])}}))
+        uids = request.url.params["id"].split(",")
+        return httpx.Response(200, text=json.dumps(_esummary_payload({uid: summaries[uid] for uid in uids})))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    search = ChapterSearch()
+
+    assert list_chapters(client, search=search) == [ChapterRef(accession="NBK111", title="Chapter One")]
+    assert list_chapters(client, search=search) == [ChapterRef(accession="NBK222", title="Chapter Two")]
+    # The 200 batch contributed nothing, so the call went on to 400 instead of
+    # reporting the source finished.
+    assert requested == ["0", "200", "400"]
+
+
+def test_list_chapters_returns_empty_only_once_the_search_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty id list is the single condition that ends the source."""
+    monkeypatch.setattr("amfv_datasets.scraping.statpearls.time.sleep", lambda _seconds: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/entrez/eutils/esearch.fcgi":
+            return httpx.Response(200, text=json.dumps({"esearchresult": {"idlist": []}}))
+        raise AssertionError("an empty batch should not be summarized")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    search = ChapterSearch()
+
+    assert list_chapters(client, search=search) == []
+    assert search.exhausted
+    # Once exhausted the cursor stops issuing requests rather than searching past the end.
+    assert list_chapters(client, search=search) == []
 
 
 def test_scrape_chapter_converts_body_content_to_markdown() -> None:
@@ -186,6 +244,51 @@ def test_scrape_chapter_converts_body_content_to_markdown() -> None:
     # Nested subsections roll up into their parent section.
     assert document.section_count == 2
     assert document.metadata == {"accession": "NBK111", "license": LICENSE, "license_url": LICENSE_URL}
+
+
+def test_scrape_chapter_resolves_relative_links_against_the_chapter_page() -> None:
+    """A relative link resolves against the chapter URL, not the Bookshelf root.
+
+    Resolving `figure/A1/` against the root would point at
+    `https://www.ncbi.nlm.nih.gov/figure/A1/`, which is a different page.
+    """
+    html = (
+        "<html><body><div id='maincontent'><div class='body-content' itemprop='text'>"
+        "<div id='article-1.s1'>"
+        "<p><a href='figure/A1/'>Figure 1</a></p>"
+        "<p><img src='bin/plot.jpg'/></p>"
+        "</div></div></div></body></html>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=html)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    document = scrape_chapter(client, ChapterRef(accession="NBK111", title="Chapter One"))
+
+    assert document is not None
+    assert "https://www.ncbi.nlm.nih.gov/books/NBK111/figure/A1/" in document.content
+    assert "https://www.ncbi.nlm.nih.gov/books/NBK111/bin/plot.jpg" in document.content
+
+
+def test_scrape_chapter_by_url_resolves_relative_links_against_the_chapter_page() -> None:
+    """The `--url` path resolves relative links against the same chapter URL."""
+    html = (
+        "<html><head><title>Chapter One - StatPearls - NCBI Bookshelf</title></head>"
+        "<body><div id='maincontent'><div class='body-content' itemprop='text'>"
+        "<div id='article-1.s1'><p><a href='figure/A1/'>Figure 1</a></p></div>"
+        "</div></div></body></html>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=html)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    document = scrape_chapter_by_url(client, "https://www.ncbi.nlm.nih.gov/books/NBK111/")
+
+    assert "https://www.ncbi.nlm.nih.gov/books/NBK111/figure/A1/" in document.content
 
 
 def test_scrape_chapter_skips_and_logs_a_page_without_readable_content(
@@ -269,6 +372,7 @@ def _mock_default_client(monkeypatch: pytest.MonkeyPatch, handler) -> None:
         lambda: httpx.Client(transport=httpx.MockTransport(handler), base_url="https://www.ncbi.nlm.nih.gov"),
     )
     monkeypatch.setattr("amfv_datasets.scraping.base.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("amfv_datasets.scraping.statpearls.time.sleep", lambda seconds: None)
 
 
 def test_scrape_statpearls_scrapes_every_discovered_chapter(monkeypatch: pytest.MonkeyPatch) -> None:
