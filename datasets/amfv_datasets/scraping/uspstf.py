@@ -69,6 +69,10 @@ from amfv_datasets.scraping.base import (
 from amfv_datasets.scraping.html import LinkMode, clean_text, html_to_markdown
 
 BASE_URL = "https://www.uspreventiveservicestaskforce.org"
+USPSTF_DOMAIN = "uspreventiveservicestaskforce.org"
+"""Registrable domain a `--url` argument has to sit on, matched exactly or as a
+parent of one of its subdomains. Matching it as a bare suffix would also accept
+lookalikes such as `notuspreventiveservicestaskforce.org`."""
 LISTING_URL = f"{BASE_URL}/uspstf/topic_search_results"
 USPSTF_DATASET_NAME = "uspstf-webscrape"
 USPSTF_DATASET_DISPLAY_NAME = "USPSTF Webscrape"
@@ -137,9 +141,10 @@ def recommendation_slug_from_url(url: str) -> str:
             `https://www.uspreventiveservicestaskforce.org/uspstf/recommendation/breast-cancer-screening`.
     """
     parsed = urlparse(url.strip())
-    host = parsed.netloc.lower()
-    if parsed.scheme not in {"http", "https"} or not host.endswith("uspreventiveservicestaskforce.org"):
-        raise UspstfFetchError(f"Enter a USPSTF URL from uspreventiveservicestaskforce.org; got {url!r}")
+    # `hostname` drops any port and lowercases, unlike `netloc`.
+    host = parsed.hostname or ""
+    if parsed.scheme not in {"http", "https"} or not (host == USPSTF_DOMAIN or host.endswith(f".{USPSTF_DOMAIN}")):
+        raise UspstfFetchError(f"Enter a USPSTF URL from {USPSTF_DOMAIN}; got {url!r}")
     match = _RECOMMENDATION_PATH_RE.match(parsed.path)
     if not match:
         raise UspstfFetchError(
@@ -252,7 +257,7 @@ def scrape_recommendation(
         return None
 
     doc = lxml_html.fromstring(response.text)
-    content, section_count = _recommendation_content(doc, link_mode=link_mode)
+    content, section_count = _recommendation_content(doc, base_url=url, link_mode=link_mode)
     if not content:
         logger.warning("Skipping USPSTF recommendation %s: no readable content", ref.slug)
         return None
@@ -295,7 +300,7 @@ def scrape_recommendation_by_url(
         raise UspstfFetchError(f"Could not fetch USPSTF recommendation '{slug}'") from exc
 
     doc = lxml_html.fromstring(response.text)
-    content, section_count = _recommendation_content(doc, link_mode=link_mode)
+    content, section_count = _recommendation_content(doc, base_url=page_url, link_mode=link_mode)
     if not content:
         raise UspstfFetchError(f"No readable content for USPSTF recommendation '{slug}'")
 
@@ -363,8 +368,19 @@ def _panel_heading(panel: lxml_html.HtmlElement) -> str:
     return clean_text(headings[0].text_content()) if headings else ""
 
 
-def _recommendation_content(doc: lxml_html.HtmlElement, *, link_mode: LinkMode) -> tuple[str, int]:
-    """Return a recommendation as markdown and the number of sections kept."""
+def _recommendation_content(doc: lxml_html.HtmlElement, *, base_url: str, link_mode: LinkMode) -> tuple[str, int]:
+    """Return a recommendation as markdown and the number of sections kept.
+
+    Args:
+        doc: Parsed recommendation page.
+        base_url: URL of the page `doc` came from, used to resolve the relative
+            links it contains. A relative link means something only against the
+            page that carries it, so passing the site root here would resolve
+            `tools/` to `/tools/` rather than to a path under the
+            recommendation.
+        link_mode: Whether links are kept as markdown links or stripped to
+            their visible text.
+    """
     sections: list[str] = []
 
     summary_tables = doc.xpath('//div[contains(@class, "summary-table")]')
@@ -372,7 +388,7 @@ def _recommendation_content(doc: lxml_html.HtmlElement, *, link_mode: LinkMode) 
         summary = html_to_markdown(
             lxml_html.tostring(summary_tables[0], encoding="unicode"),
             link_mode=link_mode,
-            base_url=BASE_URL,
+            base_url=base_url,
         )
         if summary:
             sections.append(f"## Recommendation Summary\n\n{summary}")
@@ -390,7 +406,7 @@ def _recommendation_content(doc: lxml_html.HtmlElement, *, link_mode: LinkMode) 
         body = html_to_markdown(
             lxml_html.tostring(bodies[0], encoding="unicode"),
             link_mode=link_mode,
-            base_url=BASE_URL,
+            base_url=base_url,
         )
         if not body:
             continue
@@ -428,6 +444,7 @@ __all__ = [
     "PUBLISHED_STATUS",
     "USPSTF_DATASET_DISPLAY_NAME",
     "USPSTF_DATASET_NAME",
+    "USPSTF_DOMAIN",
     "RecommendationRef",
     "UspstfFetchError",
     "list_category_recommendations",

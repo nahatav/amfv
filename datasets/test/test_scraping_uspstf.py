@@ -261,6 +261,49 @@ def test_scrape_recommendation_by_url_reads_the_title_from_the_page() -> None:
     assert document.metadata["license"] == LICENSE
 
 
+_RELATIVE_LINK_HTML = """
+    <html><body>
+      <section class="recommendation-statement-intro"><h1>Breast Cancer: Screening</h1></section>
+      <div class="summary-table"><table><tr><td><a href="grade-definitions">Grade B</a></td></tr></table></div>
+      <div id="bootstrap-panel-1" class="panel">
+        <div class="panel-title">Rationale</div>
+        <div class="panel-body"><p><a href="tools/risk-assessment">Risk tool</a></p></div>
+      </div>
+    </body></html>
+"""
+
+
+def test_scrape_recommendation_resolves_relative_links_against_the_recommendation_page() -> None:
+    """Relative links resolve against the recommendation page, not the site root.
+
+    Both conversions are covered: the summary table and a panel body. A
+    recommendation URL carries no trailing slash, so a relative reference
+    resolves against the directory holding it, `/uspstf/recommendation/`, which
+    is what a browser on that page does. Resolving against the site root instead
+    would drop that directory and yield `/grade-definitions`.
+    """
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, text=_RELATIVE_LINK_HTML)))
+
+    document = scrape_recommendation(client, RecommendationRef(slug="breast-cancer-screening", title="Breast"))
+
+    assert document is not None
+    assert f"{BASE_URL}/uspstf/recommendation/grade-definitions" in document.content
+    assert f"{BASE_URL}/uspstf/recommendation/tools/risk-assessment" in document.content
+
+
+def test_scrape_recommendation_by_url_resolves_relative_links_against_the_recommendation_page() -> None:
+    """The --url reader resolves relative links against the same page URL."""
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, text=_RELATIVE_LINK_HTML)))
+
+    document = scrape_recommendation_by_url(
+        client,
+        f"{BASE_URL}/uspstf/recommendation/breast-cancer-screening",
+    )
+
+    assert f"{BASE_URL}/uspstf/recommendation/grade-definitions" in document.content
+    assert f"{BASE_URL}/uspstf/recommendation/tools/risk-assessment" in document.content
+
+
 def test_scrape_recommendation_by_url_raises_on_fetch_failure() -> None:
     """A --url fetch failure raises rather than silently yielding nothing."""
     client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
@@ -275,8 +318,16 @@ def test_scrape_recommendation_by_url_raises_on_fetch_failure() -> None:
         ("https://example.com/uspstf/recommendation/a", "uspreventiveservicestaskforce.org"),
         (f"{BASE_URL}/uspstf/topic_search_results", "recommendation URL"),
         (f"{BASE_URL}/uspstf/about-uspstf", "recommendation URL"),
+        (
+            "https://notuspreventiveservicestaskforce.org/uspstf/recommendation/a",
+            "uspreventiveservicestaskforce.org",
+        ),
+        (
+            "https://uspreventiveservicestaskforce.org.example.com/uspstf/recommendation/a",
+            "uspreventiveservicestaskforce.org",
+        ),
     ],
-    ids=["wrong-host", "listing-page", "about-page"],
+    ids=["wrong-host", "listing-page", "about-page", "lookalike-domain", "domain-as-subdomain"],
 )
 def test_recommendation_slug_from_url_rejects_non_recommendation_urls(url: str, expected_message: str) -> None:
     """Non-recommendation URLs are rejected with a message naming the expected shape."""
@@ -284,11 +335,18 @@ def test_recommendation_slug_from_url_rejects_non_recommendation_urls(url: str, 
         recommendation_slug_from_url(url)
 
 
-def test_recommendation_slug_from_url_accepts_a_recommendation_url() -> None:
-    """A recommendation URL resolves to its slug."""
-    assert recommendation_slug_from_url(f"{BASE_URL}/uspstf/recommendation/breast-cancer-screening") == (
-        "breast-cancer-screening"
-    )
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"{BASE_URL}/uspstf/recommendation/breast-cancer-screening",
+        "https://uspreventiveservicestaskforce.org/uspstf/recommendation/breast-cancer-screening",
+        "https://www.uspreventiveservicestaskforce.org:443/uspstf/recommendation/breast-cancer-screening",
+    ],
+    ids=["www", "bare-domain", "explicit-port"],
+)
+def test_recommendation_slug_from_url_accepts_a_recommendation_url(url: str) -> None:
+    """The domain itself and its subdomains resolve to the slug, port or not."""
+    assert recommendation_slug_from_url(url) == "breast-cancer-screening"
 
 
 def _mock_default_client(monkeypatch: pytest.MonkeyPatch, handler) -> None:
