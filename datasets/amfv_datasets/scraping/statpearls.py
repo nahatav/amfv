@@ -164,10 +164,10 @@ def summarize_chapters(client: httpx.Client, section_uids: list[str]) -> list[Ch
 class ChapterSearch:
     """Cursor into the section search index, and the chapters it has yielded.
 
-    Attributes:
-        retstart: Offset of the next section batch to request.
-        exhausted: Whether the section search has run out of results.
-        seen: Chapter accessions already yielded.
+    `retstart` is held here rather than derived from the page index the shared
+    listing loop passes, because one call to `list_chapters` can consume several
+    section batches. `exhausted` records that the search itself ran out, which is
+    the only thing that ends the source.
     """
 
     retstart: int = 0

@@ -192,8 +192,12 @@ def test_list_chapters_returns_empty_only_once_the_search_is_exhausted(
     """An empty id list is the single condition that ends the source."""
     monkeypatch.setattr("amfv_datasets.scraping.statpearls.time.sleep", lambda _seconds: None)
 
+    searches = 0
+
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal searches
         if request.url.path == "/entrez/eutils/esearch.fcgi":
+            searches += 1
             return httpx.Response(200, text=json.dumps({"esearchresult": {"idlist": []}}))
         raise AssertionError("an empty batch should not be summarized")
 
@@ -202,8 +206,11 @@ def test_list_chapters_returns_empty_only_once_the_search_is_exhausted(
 
     assert list_chapters(client, search=search) == []
     assert search.exhausted
-    # Once exhausted the cursor stops issuing requests rather than searching past the end.
+    assert searches == 1
+
+    # Once exhausted the cursor stops rather than searching on past the end.
     assert list_chapters(client, search=search) == []
+    assert searches == 1
 
 
 def test_scrape_chapter_converts_body_content_to_markdown() -> None:
